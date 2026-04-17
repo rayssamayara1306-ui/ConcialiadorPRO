@@ -13,6 +13,8 @@ CONTAS_PROVISAO = {
     '161': 'Férias a pagar',
     '162': 'Rescisões a Pagar',
     '172': 'FGTS a Pagar',
+    '174': 'FGTS a Pagar',
+    '1721': 'FGTS a Pagar',
     '196': 'COFINS a Pagar',
     '197': 'PIS a Pagar',
     '642': 'Contribuição Assistencial a Pagar',
