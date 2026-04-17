@@ -272,6 +272,41 @@ def nome_match(nome_a, nome_b):
         return True
     return token_overlap(nome_a, nome_b) >= 0.7
 
+def extrair_nome_ofx(descricao):
+    texto = str(descricao or '').strip()
+    texto_upper = texto.upper()
+    if 'PAGAMENTO PIX' in texto_upper:
+        pos = texto_upper.rfind('PAGAMENTO PIX')
+        texto = texto[pos + len('PAGAMENTO PIX'):].strip()
+    texto = re.sub(r'\b(SICREDI|SICOOB|CAIXA|ITAU|BRADESCO|BANCO)\b', ' ', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\b(CX|CC|AG|DOC|TED|PIX|DEB|CRED)\s*\w*\b', ' ', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\b\d+\b', ' ', texto)
+    palavras = re.findall(r'[A-Za-zÀ-ÿ]+', texto)
+    if palavras:
+        if len(palavras) >= 2:
+            return ' '.join(palavras[-5:])
+        return ' '.join(palavras)
+    return texto
+
+def nome_match(nome_a, nome_b):
+    if not nome_a or not nome_b:
+        return False
+    if nome_a in nome_b or nome_b in nome_a:
+        return True
+    tokens_a = [t for t in nome_a.split(' ') if t]
+    tokens_b = [t for t in nome_b.split(' ') if t]
+    if tokens_a and tokens_b:
+        inter = set(tokens_a).intersection(set(tokens_b))
+        if len(inter) >= 2:
+            return True
+        if len(tokens_a) >= 2 and len(tokens_b) >= 2 and tokens_a[:2] == tokens_b[:2]:
+            return True
+        if tokens_a[0] == tokens_b[0] and len(inter) >= 1:
+            return True
+        if tokens_a[0] == tokens_b[0] and min(len(tokens_a), len(tokens_b)) <= 2:
+            return True
+    return token_overlap(nome_a, nome_b) >= 0.7
+
 def competencia_add_meses(competencia, meses):
     try:
         ano = int(competencia[:4])
@@ -393,9 +428,10 @@ def gerar_linha_sci(linha_num, data_yyyymmdd, conta_debito, conta_credito, valor
         linha = f"{linha},{participante_debito}"
     return linha
 
-def exportar_txt_sci_pagamentos(df_conciliados, conta_banco="5", cod_hist="1001", gerar_encargos=False, conta_encargos=None):
+def exportar_txt_sci_pagamentos(df_conciliados, conta_banco="5", cod_hist="1001", gerar_encargos=False, conta_encargos="563"):
     linhas = []
     linha_num = 1
+    grupos_pagamento = {}
     for _, row in df_conciliados.iterrows():
         data_pagto = str(row.get('data_pagto', '') or '')
         competencia = str(row.get('competencia', '') or '')
@@ -403,6 +439,9 @@ def exportar_txt_sci_pagamentos(df_conciliados, conta_banco="5", cod_hist="1001"
         nome_conta = str(row.get('nome_conta', '') or '')
         conta_provisao = str(row.get('conta_provisao', '') or '')
         valor_pago = float(row.get('valor_pago', 0) or 0)
+        pagamento_id = str(row.get('pagamento_id', '') or '')
+        valor_total_banco = float(row.get('valor_total_banco', valor_pago) or 0)
+        pagamento_unificado = bool(row.get('pagamento_unificado', False))
 
         if valor_pago <= 0 or not conta_provisao:
             continue
@@ -435,6 +474,37 @@ def exportar_txt_sci_pagamentos(df_conciliados, conta_banco="5", cod_hist="1001"
         )
         linha_num += 1
 
+        if pagamento_unificado and pagamento_id:
+            grupo = grupos_pagamento.setdefault(pagamento_id, {
+                'data_yyyymmdd': data_yyyymmdd,
+                'competencia': competencia,
+                'descricao_ofx': descricao_ofx,
+                'valor_total_banco': valor_total_banco,
+                'valor_principal_total': 0.0
+            })
+            grupo['valor_principal_total'] += valor_pago
+
+    if gerar_encargos and conta_encargos:
+        for grupo in grupos_pagamento.values():
+            valor_encargos = round(grupo['valor_total_banco'] - grupo['valor_principal_total'], 2)
+            if valor_encargos <= 0:
+                continue
+            complemento = f"Juros/Multa tributos {grupo['competencia']} - {grupo['descricao_ofx']}".strip()[:200]
+            linhas.append(
+                gerar_linha_sci(
+                    linha_num,
+                    grupo['data_yyyymmdd'],
+                    conta_encargos,
+                    conta_banco,
+                    valor_encargos,
+                    cod_hist,
+                    complemento,
+                    "OFX",
+                    ""
+                )
+            )
+            linha_num += 1
+
     return "\n".join(linhas)
 
 def buscar_correspondencias(provisoes, transacoes_ofx):
@@ -448,6 +518,7 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
     pagamentos['data'] = pd.to_datetime(pagamentos['data'], errors='coerce')
     pagamentos = pagamentos.sort_values(['data', 'valor_abs']).copy()
     usados_ofx = set()
+    contas_tributos_unificados = {'196', '197'}
 
     def tem_exclusao_forte(descricao):
         texto = str(descricao or '').upper()
@@ -457,15 +528,64 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
             'RECEITA', 'RFB', 'TESOURO'
         ])
 
+    def descricao_tem_indicio_tributo(descricao):
+        texto = str(descricao or '').upper()
+        return any(p in texto for p in [
+            'DARF', 'RECEITA', 'RFB', 'TESOURO', 'FEDERAL', 'ARRECAD',
+            'TRIBUTO', 'IMPOSTO', 'PIS', 'COFINS', 'CSLL', 'IRPJ', 'INSS', 'PREVID'
+        ])
+
+    def descricao_compativel_conta(conta, descricao):
+        texto = str(descricao or '').upper()
+        if str(conta) == '642':
+            return any(p in texto for p in ['ASSISTENC', 'SINDIC', 'CONTRIBUICAO']) and 'AUTOMATEC' not in texto
+        if str(conta) in {'172', '174', '1721'}:
+            return any(p in texto for p in [
+                'FGTS', 'GRF', 'CEF MATRIZ', 'CAIXA', 'CAIXA ECONOMICA',
+                'CNPJ CAIXA', 'SEFIP', 'GFIP'
+            ])
+        if str(conta) == '708':
+            return any(p in texto for p in ['INSS', 'PREVID', 'DARF', 'RECEITA', 'RFB', 'TESOURO'])
+        if str(conta) == '191':
+            return any(p in texto for p in ['CSLL', 'DARF', 'RECEITA', 'RFB', 'TESOURO'])
+        if str(conta) == '1781':
+            return any(p in texto for p in ['IRPJ', 'DARF', 'RECEITA', 'RFB', 'TESOURO'])
+        if str(conta) == '196':
+            return any(p in texto for p in ['COFINS', 'DARF', 'RECEITA', 'RFB', 'TESOURO'])
+        if str(conta) == '197':
+            return any(p in texto for p in ['PIS', 'PASEP', 'DARF', 'RECEITA', 'RFB', 'TESOURO'])
+        return False
+
     def tokens_pendentes(pendentes):
+        tokens_ignorar = {
+            'SALARIO', 'SALARIOS', 'PAGAR', 'PAGO', 'PAGAMENTO', 'FOLHA',
+            'FERIAS', 'RESCISAO', 'RESCISOES', 'PROLABORE', 'PRO', 'LABORE',
+            'DECIMO', 'TERCEIRO', 'ADIANTAMENTO'
+        }
         tokens = set()
         for item in pendentes:
             nome = item.get('nome_func', '') or ''
             nome_norm = normalizar_nome(nome)
             for t in nome_norm.split(' '):
-                if len(t) >= 3:
+                if len(t) >= 3 and t not in tokens_ignorar:
                     tokens.add(t)
         return tokens
+
+    def nome_folha_util(nome):
+        nome_norm = normalizar_nome(nome)
+        if not nome_norm:
+            return ''
+        tokens_invalidos = {
+            'SALARIO', 'SALARIOS', 'PAGAR', 'PAGO', 'PAGAMENTO', 'FOLHA',
+            'FERIAS', 'RESCISAO', 'RESCISOES', 'PROLABORE', 'DECIMO',
+            'TERCEIRO', 'ADIANTAMENTO'
+        }
+        tokens = [t for t in nome_norm.split(' ') if t and t not in tokens_invalidos]
+        if not tokens:
+            return ''
+        if len(tokens) == 1 and len(tokens[0]) <= 3:
+            return ''
+        return ' '.join(tokens)
 
     def eh_provavel_folha_categoria(descricao, conta, tokens_nome):
         texto = str(descricao or '').upper()
@@ -476,7 +596,7 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
         else:
             inclui = any(p in texto for p in [
                 'SAL', 'SALAR', 'FOLHA', 'LIQ', 'PAGTO SAL', 'PAGAMENTO SAL',
-                'PIX SICREDI-'
+                'HOLERITE', 'PAGTO FOLHA'
             ])
         if str(conta) == '169':
             # Para pro-labore, exige nome do socio (tokens) no historico
@@ -500,6 +620,8 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                 tolerancia_antes=3,
                 tolerancia_depois=10 if fallback else 5
             )
+        elif str(conta) in contas_tributos_unificados:
+            inicio, fim = competencia_range(competencia, dias_pos=90 if fallback else 60)
         else:
             inicio, fim = competencia_range(competencia, dias_pos=35 if fallback else 10)
         if not inicio or not fim:
@@ -516,13 +638,69 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
             'data': data_fmt,
             'descricao': pay['descricao'],
             'valor': pay['valor_abs'],
+            'valor_total_banco': pay['valor_abs'],
+            'pagamento_id': str(getattr(pay, 'name', '')),
             'nome_func': nome_func,
             'tipo': tipo,
             'chave': ''
         }
 
+    conciliacao_tributos_unificados = {}
+    grupos_tributos = {}
+    for (conta, competencia), dados in sorted(provisoes.items(), key=lambda item: (item[0][1], item[0][0])):
+        if str(conta) not in contas_tributos_unificados:
+            continue
+        valor = float(dados['creditos'] - dados['ajustes'])
+        if valor <= 0:
+            continue
+        grupos_tributos.setdefault(competencia, []).append((conta, dados, valor))
+
+    for competencia, itens in grupos_tributos.items():
+        if len(itens) < 2:
+            continue
+        total_grupo = sum(valor for _, _, valor in itens)
+        tolerancia_superior = max(10.0, total_grupo * 0.25)
+        candidatos = pagamentos[
+            (~pagamentos.index.isin(usados_ofx)) &
+            (pagamentos['data'].apply(lambda data: pagamento_na_janela(data, competencia, '196', fallback=True))) &
+            (pagamentos['descricao'].apply(descricao_tem_indicio_tributo))
+        ].sort_values('data')
+        match_idx = None
+        for idx, pay in candidatos.iterrows():
+            valor_pago = float(pay['valor_abs'])
+            if total_grupo <= valor_pago <= (total_grupo + tolerancia_superior):
+                match_idx = idx
+                break
+        if match_idx is None:
+            continue
+        usados_ofx.add(match_idx)
+        pay = pagamentos.loc[match_idx]
+        valor_total_pago = float(pay['valor_abs'])
+        for conta, dados, valor in itens:
+            transacao = montar_transacao(pay, tipo='tributo_unificado')
+            transacao['valor'] = valor
+            conciliacao_tributos_unificados[(conta, competencia)] = {
+                'conta': conta,
+                'nome_conta': dados['nome_conta'],
+                'competencia': competencia,
+                'valor_provisao': valor,
+                'encontrado': True,
+                'transacoes': [transacao],
+                'total_pago': valor,
+                'total_pendente': 0.0,
+                'status_total': 'QUITADO',
+                'competencia_pagamento': competencia_add_meses(competencia, 1),
+                'lancamentos_razao': dados.get('lancamentos', []),
+                'pagamento_unificado': True,
+                'valor_total_pago_banco': valor_total_pago
+            }
+
     for (conta, competencia), dados in sorted(provisoes.items(), key=lambda item: (item[0][1], item[0][0])):
         valor_provisao = dados['creditos'] - dados['ajustes']
+
+        if (conta, competencia) in conciliacao_tributos_unificados:
+            resultados.append(conciliacao_tributos_unificados[(conta, competencia)])
+            continue
 
         if str(conta) in CONTAS_FOLHA:
             itens_folha = []
@@ -537,7 +715,7 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                     'competencia': competencia,
                     'conta_provisao': conta,
                     'nome_func': nome_func,
-                    'nome_norm': normalizar_nome(nome_func),
+                    'nome_norm': nome_folha_util(nome_func),
                     'valor': valor_item,
                     'historico': historico,
                     'chave': lanc.get('chave', ''),
@@ -589,43 +767,45 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
             total_itens = sum(i['valor'] for i in itens_folha)
             total_pendente = max(total_itens - total_conciliado, 0.0)
             status_total = 'PENDENTE'
+            ha_nomes_uteis = any(i['nome_norm'] for i in itens_folha)
             if total_pendente > 0:
                 tokens_nome = tokens_pendentes(pendentes_func)
                 nomes_pendentes_norm = [
-                    normalizar_nome(p.get('nome_func', '') or '')
+                    nome_folha_util(p.get('nome_func', '') or '')
                     for p in pendentes_func
-                    if p.get('nome_func')
+                    if nome_folha_util(p.get('nome_func', '') or '')
                 ]
-                candidatos_idx = []
-                for idx, pay in pagamentos.iterrows():
-                    if idx in usados_ofx:
-                        continue
-                    if not pagamento_na_janela(pay['data'], competencia, conta, fallback=True):
-                        continue
-                    if tem_exclusao_forte(pay['descricao']):
-                        continue
-                    if str(conta) == '169':
-                        if not nomes_pendentes_norm:
+                if not ha_nomes_uteis:
+                    candidatos_idx = []
+                    for idx, pay in pagamentos.iterrows():
+                        if idx in usados_ofx:
                             continue
-                        if not any(nome_match(n, pay['nome_norm']) for n in nomes_pendentes_norm):
+                        if not pagamento_na_janela(pay['data'], competencia, conta, fallback=True):
                             continue
-                    else:
-                        if not eh_provavel_folha_categoria(pay['descricao'], conta, tokens_nome):
+                        if tem_exclusao_forte(pay['descricao']):
                             continue
-                    if pay['valor_abs'] > (1.5 * total_pendente):
-                        continue
-                    candidatos_idx.append(idx)
+                        if str(conta) == '169':
+                            if not nomes_pendentes_norm:
+                                continue
+                            if not any(nome_match(n, pay['nome_norm']) for n in nomes_pendentes_norm):
+                                continue
+                        else:
+                            if not eh_provavel_folha_categoria(pay['descricao'], conta, tokens_nome):
+                                continue
+                        if pay['valor_abs'] > (1.5 * total_pendente):
+                            continue
+                        candidatos_idx.append(idx)
 
-                candidatos = pagamentos.loc[candidatos_idx].sort_values('data')
-                soma_candidatos = candidatos['valor_abs'].sum() if not candidatos.empty else 0.0
-                if soma_candidatos > 0:
-                    acumulado = 0.0
-                    for idx, pay in candidatos.iterrows():
-                        if acumulado >= total_pendente:
-                            break
-                        usados_ofx.add(idx)
-                        transacoes_encontradas.append(montar_transacao(pay, tipo='total'))
-                        acumulado += pay['valor_abs']
+                    candidatos = pagamentos.loc[candidatos_idx].sort_values('data')
+                    soma_candidatos = candidatos['valor_abs'].sum() if not candidatos.empty else 0.0
+                    if soma_candidatos > 0:
+                        acumulado = 0.0
+                        for idx, pay in candidatos.iterrows():
+                            if acumulado >= total_pendente:
+                                break
+                            usados_ofx.add(idx)
+                            transacoes_encontradas.append(montar_transacao(pay, tipo='total'))
+                            acumulado += pay['valor_abs']
 
             total_pago_banco = sum(t['valor'] for t in transacoes_encontradas)
             total_pendente_final = max(total_itens - total_pago_banco, 0.0)
@@ -659,7 +839,11 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
             (abs(pagamentos['valor_abs'] - valor_provisao) < 0.01) &
             (~pagamentos.index.isin(usados_ofx))
         ].copy()
-        matches = matches[matches['data'].apply(lambda data: pagamento_na_janela(data, competencia, conta, fallback=True))]
+        datas_match = matches.get('data', pd.Series(pd.NaT, index=matches.index))
+        descricoes_match = matches.get('descricao', pd.Series('', index=matches.index))
+        matches = matches[datas_match.apply(lambda data: pagamento_na_janela(data, competencia, conta, fallback=True))]
+        descricoes_match = matches.get('descricao', pd.Series('', index=matches.index))
+        matches = matches[descricoes_match.apply(lambda desc: descricao_compativel_conta(conta, desc))]
 
         if not matches.empty:
             transacoes_encontradas = []
@@ -744,12 +928,12 @@ elif st.session_state.etapa == 2 and tem_provisoes():
     st.markdown("### 📊 2. Provisões Identificadas")
 
     provisoes = st.session_state.provisoes
-    anos_competencia = sorted({competencia_ano(comp) for (_, comp) in provisoes.keys() if competencia_ano(comp)})
-    opcoes_ano = ["Todos"] + anos_competencia
-    ano_selecionado = st.selectbox("Filtrar ano da competencia", opcoes_ano, index=0)
+    competencias_disponiveis = sorted({str(comp or '') for (_, comp) in provisoes.keys() if str(comp or '')})
+    opcoes_competencia = ["Todos"] + competencias_disponiveis
+    competencia_selecionada = st.selectbox("Filtrar competencia da provisao", opcoes_competencia, index=0)
     provisoes_filtradas = {
         chave: dados for chave, dados in provisoes.items()
-        if ano_selecionado == "Todos" or competencia_ano(chave[1]) == ano_selecionado
+        if competencia_selecionada == "Todos" or str(chave[1] or '') == competencia_selecionada
     }
 
     # Resumo
@@ -935,12 +1119,12 @@ elif st.session_state.etapa == 4 and tem_provisoes() and tem_ofx():
 
     with st.spinner("Buscando correspondências..."):
         resultados = buscar_correspondencias(provisoes, transacoes_ofx)
-    anos_resultados = sorted({competencia_ano(r.get('competencia', '')) for r in resultados if competencia_ano(r.get('competencia', ''))})
-    opcoes_ano_resultado = ["Todos"] + anos_resultados
-    ano_resultado = st.selectbox("Filtrar ano da competencia conciliada", opcoes_ano_resultado, index=0)
+    competencias_resultados = sorted({str(r.get('competencia', '') or '') for r in resultados if str(r.get('competencia', '') or '')})
+    opcoes_competencia_resultado = ["Todos"] + competencias_resultados
+    competencia_resultado = st.selectbox("Filtrar competencia da provisao", opcoes_competencia_resultado, index=0)
     resultados_filtrados = [
         r for r in resultados
-        if ano_resultado == "Todos" or competencia_ano(r.get('competencia', '')) == ano_resultado
+        if competencia_resultado == "Todos" or str(r.get('competencia', '') or '') == competencia_resultado
     ]
 
     dados_conciliados = []
@@ -958,7 +1142,10 @@ elif st.session_state.etapa == 4 and tem_provisoes() and tem_ofx():
                     'descricao_func': trans.get('nome_func', ''),
                     'nome_conta': resultado.get('nome_conta', ''),
                     'chave': trans.get('chave', ''),
-                    'participante_debito': trans.get('participante_debito', '')
+                    'participante_debito': trans.get('participante_debito', ''),
+                    'pagamento_id': trans.get('pagamento_id', ''),
+                    'valor_total_banco': trans.get('valor_total_banco', trans.get('valor', 0)),
+                    'pagamento_unificado': resultado.get('pagamento_unificado', False)
                 })
     st.session_state.df_conciliados = pd.DataFrame(dados_conciliados)
 
@@ -1192,10 +1379,14 @@ elif st.session_state.etapa == 5:
             escolha = st.selectbox("Conta Crédito (Banco)", opcoes)
             conta_banco = MAPA_CONTAS_BANCO[escolha.split()[0]]
         cod_hist = st.text_input("Código de Histórico", value="1001")
+        gerar_encargos = st.checkbox("Gerar juros/multa separado", value=True)
+        conta_encargos = st.text_input("Conta D?bito Juros/Multa", value="563") if gerar_encargos else "563"
         txt = exportar_txt_sci_pagamentos(
             df_conciliados,
             conta_banco=conta_banco,
-            cod_hist=cod_hist
+            cod_hist=cod_hist,
+            gerar_encargos=gerar_encargos,
+            conta_encargos=conta_encargos
         )
 
         st.download_button(
@@ -1217,3 +1408,6 @@ elif st.session_state.etapa == 5:
 # ======================================================
 st.divider()
 st.caption("Conciliador PRO • Sistema de conciliação contábil")
+
+
+
