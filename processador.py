@@ -132,6 +132,11 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
             mes -= 1
         return f"{ano}{mes:02d}"
 
+    def competencia_referencia_atual():
+        if data_atual:
+            return competencia_aaaamm(data_atual)
+        return competencia_inicial
+
     for idx, row in df.iterrows():
         historico = str(row.iloc[0]) if len(row) > 0 and not pd.isna(row.iloc[0]) else ''
         debito = converter_valor(row.iloc[3]) if len(row) > 3 else 0.0
@@ -196,7 +201,8 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
                     print(f"  → 💰 SALDO ANTERIOR ENCONTRADO: R$ {saldo_anterior:.2f}")
 
                 # Criar competência
-                competencia = competencia_anterior(competencia_inicial)
+                competencia_base = competencia_referencia_atual()
+                competencia = competencia_anterior(competencia_base)
                 if not competencia:
                     continue
                 chave = (conta_atual, competencia)
@@ -245,7 +251,7 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
             continue
 
         # 6/7. Criar/obter provisão
-        competencia = competencia_aaaamm(data_atual) if data_atual else competencia_inicial
+        competencia = competencia_referencia_atual()
         if not competencia:
             if debug_708:
                 print(f"  → ⏭️  PULANDO (sem competência)")
