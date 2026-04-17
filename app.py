@@ -272,7 +272,18 @@ def nome_match(nome_a, nome_b):
         return True
     return token_overlap(nome_a, nome_b) >= 0.7
 
-def competencia_range(competencia, dias_pos=60):
+def competencia_add_meses(competencia, meses):
+    try:
+        ano = int(competencia[:4])
+        mes = int(competencia[4:6])
+        total = (ano * 12) + (mes - 1) + meses
+        novo_ano = total // 12
+        novo_mes = (total % 12) + 1
+        return f"{novo_ano}{novo_mes:02d}"
+    except Exception:
+        return None
+
+def competencia_intervalo_mes(competencia):
     try:
         ano = int(competencia[:4])
         mes = int(competencia[4:6])
@@ -281,11 +292,26 @@ def competencia_range(competencia, dias_pos=60):
             prox = datetime(ano + 1, 1, 1)
         else:
             prox = datetime(ano, mes + 1, 1)
-        fim_mes = prox - timedelta(days=1)
-        fim = fim_mes + timedelta(days=dias_pos)
-        return inicio, fim
+        return inicio, prox - timedelta(days=1)
     except Exception:
         return None, None
+
+def competencia_range(competencia, dias_pos=60):
+    inicio, fim_mes = competencia_intervalo_mes(competencia)
+    if not inicio or not fim_mes:
+        return None, None
+    return inicio, fim_mes + timedelta(days=dias_pos)
+
+def competencia_pagamento_range(competencia, tolerancia_antes=3, tolerancia_depois=20):
+    competencia_pagto = competencia_add_meses(competencia, 1)
+    inicio_pagto, fim_pagto = competencia_intervalo_mes(competencia_pagto)
+    if not inicio_pagto or not fim_pagto:
+        return None, None
+    return inicio_pagto - timedelta(days=tolerancia_antes), fim_pagto + timedelta(days=tolerancia_depois)
+
+def competencia_ano(competencia):
+    texto = str(competencia or '')
+    return texto[:4] if len(texto) >= 4 else ''
 
 def normalizar_coluna(nome):
     texto = str(nome).strip().lower()
@@ -420,6 +446,7 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
     pagamentos['descricao'] = pagamentos['descricao'].astype(str)
     pagamentos['nome_norm'] = pagamentos['descricao'].apply(lambda d: normalizar_nome(extrair_nome_ofx(d)))
     pagamentos['data'] = pd.to_datetime(pagamentos['data'], errors='coerce')
+    pagamentos = pagamentos.sort_values(['data', 'valor_abs']).copy()
     usados_ofx = set()
 
     def tem_exclusao_forte(descricao):
@@ -464,7 +491,37 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                 return True
         return False
 
-    for (conta, competencia), dados in provisoes.items():
+    def pagamento_na_janela(data_pagamento, competencia, conta, fallback=False):
+        if pd.isna(data_pagamento):
+            return False
+        if str(conta) in CONTAS_FOLHA:
+            inicio, fim = competencia_pagamento_range(
+                competencia,
+                tolerancia_antes=3,
+                tolerancia_depois=10 if fallback else 5
+            )
+        else:
+            inicio, fim = competencia_range(competencia, dias_pos=35 if fallback else 10)
+        if not inicio or not fim:
+            return True
+        return inicio <= data_pagamento <= fim
+
+    def montar_transacao(pay, nome_func='', tipo='pagamento'):
+        data_match = pay['data']
+        if hasattr(data_match, 'strftime'):
+            data_fmt = data_match.strftime('%d/%m/%Y')
+        else:
+            data_fmt = str(data_match)
+        return {
+            'data': data_fmt,
+            'descricao': pay['descricao'],
+            'valor': pay['valor_abs'],
+            'nome_func': nome_func,
+            'tipo': tipo,
+            'chave': ''
+        }
+
+    for (conta, competencia), dados in sorted(provisoes.items(), key=lambda item: (item[0][1], item[0][0])):
         valor_provisao = dados['creditos'] - dados['ajustes']
 
         if str(conta) in CONTAS_FOLHA:
@@ -491,7 +548,6 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
             conciliados_func = []
             pendentes_func = []
             total_conciliado = 0.0
-            inicio, fim = competencia_range(competencia, dias_pos=60)
 
             for item in itens_folha:
                 if not item['nome_norm']:
@@ -506,9 +562,8 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                         continue
                     if abs(pay['valor_abs'] - item['valor']) > 0.01:
                         continue
-                    if inicio and fim:
-                        if pd.isna(pay['data']) or not (inicio <= pay['data'] <= fim):
-                            continue
+                    if not pagamento_na_janela(pay['data'], competencia, conta):
+                        continue
                     if not nome_match(item['nome_norm'], pay['nome_norm']):
                         continue
                     match_idx = idx
@@ -517,23 +572,11 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                 if match_idx is not None:
                     pay = pagamentos.loc[match_idx]
                     usados_ofx.add(match_idx)
-                    data_match = pay['data']
-                    if hasattr(data_match, 'strftime'):
-                        data_fmt = data_match.strftime('%d/%m/%Y')
-                    else:
-                        data_fmt = str(data_match)
-                    transacoes_encontradas.append({
-                        'data': data_fmt,
-                        'descricao': pay['descricao'],
-                        'valor': pay['valor_abs'],
-                        'nome_func': item['nome_func'],
-                        'tipo': 'funcionario',
-                        'chave': ''
-                    })
+                    transacoes_encontradas.append(montar_transacao(pay, nome_func=item['nome_func'], tipo='funcionario'))
                     conciliados_func.append({
                         'nome_func': item['nome_func'],
                         'valor': item['valor'],
-                        'data': data_fmt,
+                        'data': transacoes_encontradas[-1]['data'],
                         'descricao_ofx': pay['descricao']
                     })
                     total_conciliado += item['valor']
@@ -547,7 +590,6 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
             total_pendente = max(total_itens - total_conciliado, 0.0)
             status_total = 'PENDENTE'
             if total_pendente > 0:
-                inicio_total, fim_total = competencia_range(competencia, dias_pos=10)
                 tokens_nome = tokens_pendentes(pendentes_func)
                 nomes_pendentes_norm = [
                     normalizar_nome(p.get('nome_func', '') or '')
@@ -558,9 +600,8 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                 for idx, pay in pagamentos.iterrows():
                     if idx in usados_ofx:
                         continue
-                    if inicio_total and fim_total:
-                        if pd.isna(pay['data']) or not (inicio_total <= pay['data'] <= fim_total):
-                            continue
+                    if not pagamento_na_janela(pay['data'], competencia, conta, fallback=True):
+                        continue
                     if tem_exclusao_forte(pay['descricao']):
                         continue
                     if str(conta) == '169':
@@ -583,19 +624,7 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                         if acumulado >= total_pendente:
                             break
                         usados_ofx.add(idx)
-                        data_match = pay['data']
-                        if hasattr(data_match, 'strftime'):
-                            data_fmt = data_match.strftime('%d/%m/%Y')
-                        else:
-                            data_fmt = str(data_match)
-                        transacoes_encontradas.append({
-                            'data': data_fmt,
-                            'descricao': pay['descricao'],
-                            'valor': pay['valor_abs'],
-                            'nome_func': '',
-                            'tipo': 'total',
-                            'chave': ''
-                        })
+                        transacoes_encontradas.append(montar_transacao(pay, tipo='total'))
                         acumulado += pay['valor_abs']
 
             total_pago_banco = sum(t['valor'] for t in transacoes_encontradas)
@@ -621,25 +650,22 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                 'total_provisao': total_itens,
                 'total_pago': total_pago_banco,
                 'total_pendente': total_pendente_final,
-                'status_total': status_total
+                'status_total': status_total,
+                'competencia_pagamento': competencia_add_meses(competencia, 1)
             })
             continue
 
-        matches = pagamentos[abs(pagamentos['valor_abs'] - valor_provisao) < 0.01]
+        matches = pagamentos[
+            (abs(pagamentos['valor_abs'] - valor_provisao) < 0.01) &
+            (~pagamentos.index.isin(usados_ofx))
+        ].copy()
+        matches = matches[matches['data'].apply(lambda data: pagamento_na_janela(data, competencia, conta, fallback=True))]
 
         if not matches.empty:
             transacoes_encontradas = []
-            for _, match in matches.iterrows():
-                data_match = match['data']
-                if hasattr(data_match, 'strftime'):
-                    data_fmt = data_match.strftime('%d/%m/%Y')
-                else:
-                    data_fmt = str(data_match)
-                transacoes_encontradas.append({
-                    'data': data_fmt,
-                    'descricao': match['descricao'],
-                    'valor': match['valor_abs']
-                })
+            for idx, match in matches.iterrows():
+                usados_ofx.add(idx)
+                transacoes_encontradas.append(montar_transacao(match))
 
             resultados.append({
                 'conta': conta,
@@ -647,7 +673,8 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                 'competencia': competencia,
                 'valor_provisao': valor_provisao,
                 'encontrado': True,
-                'transacoes': transacoes_encontradas
+                'transacoes': transacoes_encontradas,
+                'competencia_pagamento': competencia_add_meses(competencia, 1)
             })
         else:
             resultados.append({
@@ -656,7 +683,8 @@ def buscar_correspondencias(provisoes, transacoes_ofx):
                 'competencia': competencia,
                 'valor_provisao': valor_provisao,
                 'encontrado': False,
-                'transacoes': []
+                'transacoes': [],
+                'competencia_pagamento': competencia_add_meses(competencia, 1)
             })
 
     return resultados
@@ -716,15 +744,22 @@ elif st.session_state.etapa == 2 and tem_provisoes():
     st.markdown("### 📊 2. Provisões Identificadas")
 
     provisoes = st.session_state.provisoes
+    anos_competencia = sorted({competencia_ano(comp) for (_, comp) in provisoes.keys() if competencia_ano(comp)})
+    opcoes_ano = ["Todos"] + anos_competencia
+    ano_selecionado = st.selectbox("Filtrar ano da competencia", opcoes_ano, index=0)
+    provisoes_filtradas = {
+        chave: dados for chave, dados in provisoes.items()
+        if ano_selecionado == "Todos" or competencia_ano(chave[1]) == ano_selecionado
+    }
 
     # Resumo
-    total_creditos = sum(d['creditos'] for d in provisoes.values())
-    total_ajustes = sum(d['ajustes'] for d in provisoes.values())
+    total_creditos = sum(d['creditos'] for d in provisoes_filtradas.values())
+    total_ajustes = sum(d['ajustes'] for d in provisoes_filtradas.values())
     saldo_total = total_creditos - total_ajustes
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Contas", len(provisoes))
+        st.metric("Contas", len(provisoes_filtradas))
     with col2:
         st.metric("Total Provisões", f"R$ {total_creditos:,.2f}")
     with col3:
@@ -733,7 +768,7 @@ elif st.session_state.etapa == 2 and tem_provisoes():
     st.divider()
 
     # Cada conta em um card BONITO e FUNCIONAL
-    for (conta, competencia), dados in sorted(provisoes.items()):
+    for (conta, competencia), dados in sorted(provisoes_filtradas.items()):
         saldo = dados['creditos'] - dados['ajustes']
 
         # Container principal
@@ -798,7 +833,7 @@ elif st.session_state.etapa == 2 and tem_provisoes():
     with col_btn2:
         # Exportar
         dados_export = []
-        for (conta, competencia), dados in provisoes.items():
+        for (conta, competencia), dados in provisoes_filtradas.items():
             dados_export.append({
                 'Conta': conta,
                 'Nome': dados['nome_conta'],
@@ -900,9 +935,16 @@ elif st.session_state.etapa == 4 and tem_provisoes() and tem_ofx():
 
     with st.spinner("Buscando correspondências..."):
         resultados = buscar_correspondencias(provisoes, transacoes_ofx)
+    anos_resultados = sorted({competencia_ano(r.get('competencia', '')) for r in resultados if competencia_ano(r.get('competencia', ''))})
+    opcoes_ano_resultado = ["Todos"] + anos_resultados
+    ano_resultado = st.selectbox("Filtrar ano da competencia conciliada", opcoes_ano_resultado, index=0)
+    resultados_filtrados = [
+        r for r in resultados
+        if ano_resultado == "Todos" or competencia_ano(r.get('competencia', '')) == ano_resultado
+    ]
 
     dados_conciliados = []
-    for resultado in resultados:
+    for resultado in resultados_filtrados:
         if resultado['encontrado']:
             for trans in resultado['transacoes']:
                 dados_conciliados.append({
@@ -920,8 +962,8 @@ elif st.session_state.etapa == 4 and tem_provisoes() and tem_ofx():
                 })
     st.session_state.df_conciliados = pd.DataFrame(dados_conciliados)
 
-    encontrados = sum(1 for r in resultados if r['encontrado'])
-    total = len(resultados)
+    encontrados = sum(1 for r in resultados_filtrados if r['encontrado'])
+    total = len(resultados_filtrados)
 
     st.success(f"✅ {encontrados} de {total} provisões encontradas")
 
@@ -940,7 +982,7 @@ elif st.session_state.etapa == 4 and tem_provisoes() and tem_ofx():
         index=0
     )
 
-    for resultado in resultados:
+    for resultado in resultados_filtrados:
         if filtro == "Encontrados" and not resultado['encontrado']:
             continue
         if filtro == "Nao encontrados" and resultado['encontrado']:
@@ -967,6 +1009,7 @@ elif st.session_state.etapa == 4 and tem_provisoes() and tem_ofx():
                     </span>
                 </div>
             """, unsafe_allow_html=True)
+            st.caption(f"Competencia esperada do pagamento: {resultado.get('competencia_pagamento', '')}")
 
             conciliados = resultado.get('conciliados_func', [])
             pendentes = resultado.get('pendentes_func', [])
@@ -1043,6 +1086,7 @@ elif st.session_state.etapa == 4 and tem_provisoes() and tem_ofx():
                     </span>
                 </div>
             """, unsafe_allow_html=True)
+            st.caption(f"Competencia esperada do pagamento: {resultado.get('competencia_pagamento', '')}")
 
             # Mostrar pagamentos encontrados
             for trans in resultado['transacoes']:
@@ -1173,6 +1217,3 @@ elif st.session_state.etapa == 5:
 # ======================================================
 st.divider()
 st.caption("Conciliador PRO • Sistema de conciliação contábil")
-
-
-
