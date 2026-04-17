@@ -8,6 +8,8 @@ CONTAS_PROVISAO = {
     '163': '13º Salário a Pagar',
     '169': 'Pro-labore a Pagar',
     '172': 'FGTS a Pagar',
+    '174': 'FGTS a Pagar',
+    '1721': 'FGTS a Pagar',
     '196': 'COFINS a Pagar',
     '197': 'PIS a Pagar',
     '642': 'Contribuição Assistencial a Pagar',
@@ -116,6 +118,7 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
     conta_atual = None
     nome_conta_atual = None
     data_atual = None
+    saldo_anterior_pendente = 0.0
 
     def competencia_aaaamm(dt):
         return dt.strftime('%Y%m')
@@ -136,6 +139,39 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
         if data_atual:
             return competencia_aaaamm(data_atual)
         return competencia_inicial
+
+    def obter_ou_criar_provisao(conta, competencia):
+        chave = (conta, competencia)
+        if chave not in provisoes:
+            provisoes[chave] = {
+                'conta': conta,
+                'nome_conta': CONTAS_PROVISAO[conta],
+                'competencia': competencia,
+                'creditos': 0.0,
+                'ajustes': 0.0,
+                'lancamentos': []
+            }
+        return chave
+
+    def aplicar_saldo_anterior_pendente():
+        nonlocal saldo_anterior_pendente
+        if saldo_anterior_pendente <= 0 or not conta_atual:
+            return
+        competencia_base = competencia_referencia_atual()
+        competencia = competencia_anterior(competencia_base)
+        if not competencia:
+            return
+        chave = obter_ou_criar_provisao(conta_atual, competencia)
+        provisoes[chave]['creditos'] += saldo_anterior_pendente
+        provisoes[chave]['lancamentos'].append({
+            'data': '',
+            'historico': f"Saldo anterior - {nome_conta_atual}",
+            'chave': '',
+            'contra': '',
+            'tipo': 'Credito (Saldo Anterior)',
+            'valor': saldo_anterior_pendente
+        })
+        saldo_anterior_pendente = 0.0
 
     for idx, row in df.iterrows():
         historico = str(row.iloc[0]) if len(row) > 0 and not pd.isna(row.iloc[0]) else ''
@@ -182,8 +218,10 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
         is_cabecalho, conta_numero, nome_conta = is_cabecalho_conta(historico)
 
         if is_cabecalho:
+            aplicar_saldo_anterior_pendente()
             conta_atual = conta_numero
             nome_conta_atual = nome_conta
+            data_atual = None
 
             data_str = data_atual.strftime('%d/%m/%Y') if data_atual else ''
             if not data_str:
@@ -201,32 +239,7 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
                     print(f"  → 💰 SALDO ANTERIOR ENCONTRADO: R$ {saldo_anterior:.2f}")
 
                 # Criar competência
-                competencia_base = competencia_referencia_atual()
-                competencia = competencia_anterior(competencia_base)
-                if not competencia:
-                    continue
-                chave = (conta_atual, competencia)
-
-                if chave not in provisoes:
-                    provisoes[chave] = {
-                        'conta': conta_atual,
-                        'nome_conta': CONTAS_PROVISAO[conta_atual],
-                        'competencia': competencia,
-                        'creditos': 0.0,
-                        'ajustes': 0.0,
-                        'lancamentos': []
-                    }
-
-                # Adicionar saldo anterior
-                provisoes[chave]['creditos'] += saldo_anterior
-                provisoes[chave]['lancamentos'].append({
-                    'data': '',
-                    'historico': f"Saldo anterior - {nome_conta}",
-                    'chave': '',
-                    'contra': '',
-                    'tipo': 'Credito (Saldo Anterior)',
-                    'valor': saldo_anterior
-                })
+                saldo_anterior_pendente = saldo_anterior
             elif debug_708:
                 print(f"  → ⚠️  Nenhum saldo anterior encontrado")
 
@@ -256,17 +269,8 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
             if debug_708:
                 print(f"  → ⏭️  PULANDO (sem competência)")
             continue
-        chave = (conta_atual, competencia)
-
-        if chave not in provisoes:
-            provisoes[chave] = {
-                'conta': conta_atual,
-                'nome_conta': CONTAS_PROVISAO[conta_atual],
-                'competencia': competencia,
-                'creditos': 0.0,
-                'ajustes': 0.0,
-                'lancamentos': []
-            }
+        aplicar_saldo_anterior_pendente()
+        chave = obter_ou_criar_provisao(conta_atual, competencia)
 
         # 8. Processar CRÉDITOS
         if credito > 0:
@@ -308,6 +312,7 @@ def processar_passivo_corrigido(df, competencia_inicial=None):
                 if debug_708:
                     print(f"  → 🔴 Ajuste adicionado: R$ {debito:.2f}")
 
+    aplicar_saldo_anterior_pendente()
     return provisoes
 
 def main():
